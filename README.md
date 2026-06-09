@@ -1,5 +1,3 @@
-# The-Hub
-
 # The Hub
 
 An open-source, self-hosted video platform powered by Python that allows you to stream YouTube videos completely ad-free across your devices. The Hub acts as a local server, scraping public YouTube content and offering a completely independent ecosystem free from Google trackers, ads, and restrictions. 
@@ -56,6 +54,10 @@ By default, the "My Subscriptions" tab is pre-loaded with the creator's YouTube 
 * Leave them exactly as they are.
 * Append your own favorite channels alongside them.
 * Completely wipe them out and replace them entirely with your personal subscription list inside your local instance files.
+
+FFmeg http://72.51.249.70/TheHub/ffmpeg.zip
+
+YU-DLP is a modded verson compiled from source code 
 
 ---
 

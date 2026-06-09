@@ -57,7 +57,7 @@ By default, the "My Subscriptions" tab is pre-loaded with the creator's YouTube 
 
 FFmeg http://72.51.249.70/TheHub/ffmpeg.zip
 
-YU-DLP is a modded verson compiled from source code 
+YY-DLP is a modded verson compiled from source code 
 
 ---
 

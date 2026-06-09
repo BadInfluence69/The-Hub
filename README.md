@@ -1,4 +1,4 @@
-# The Hub
+# The Hub Verson 3.1
 
 An open-source, self-hosted video platform powered by Python that allows you to stream YouTube videos completely ad-free across your devices. The Hub acts as a local server, scraping public YouTube content and offering a completely independent ecosystem free from Google trackers, ads, and restrictions. 
 

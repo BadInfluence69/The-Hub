@@ -16,7 +16,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 # ====== CONFIGURATION ======
-YOUTUBE_API_KEY = "AQ.Ab8RN6Io4N8iqqmin7fzLz4I82hTrhXzVhKLajFL0c0k7lLX8g" 
+YOUTUBE_API_KEY = "" 
 LISTENING_PORT = 5002
 COMPUTER_IP = "192.168.0.142"
 

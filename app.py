@@ -1,3 +1,4 @@
+#watch/tubi_100059630
 import os
 import sys
 import urllib.parse
@@ -5,6 +6,7 @@ import re
 import json
 import sqlite3
 import requests
+import yt_dlp
 import subprocess
 import random
 from datetime import datetime
@@ -14,18 +16,18 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 # ====== CONFIGURATION ======
-YOUTUBE_API_KEY = "" 
+YOUTUBE_API_KEY = "AQ.Ab8RN6Io4N8iqqmin7fzLz4I82hTrhXzVhKLajFL0c0k7lLX8g" 
 LISTENING_PORT = 5002
 COMPUTER_IP = "192.168.0.142"
 
 # ====== LOCAL MEDIA LIBRARY PATHS ======
-LOCAL_MEDIA_BASE = ""
+LOCAL_MEDIA_BASE = r"E:\Media"
 MEDIA_FOLDERS = {
     "movies": os.path.join(LOCAL_MEDIA_BASE, "Movies"),
-    "tv_shows": os.path.join(LOCAL_MEDIA_BASE, "TV")
+    "tv_shows": os.path.join(LOCAL_MEDIA_BASE, "TV"),
+    "porn": os.path.join(LOCAL_MEDIA_BASE, "Porn")
 }
 
-# Cryptographic secret key to sign independent browser sessions securely
 app.secret_key = os.urandom(24)
 
 RECENT_SEARCH_HISTORY = []
@@ -43,6 +45,207 @@ if not subprocess.run(["where" if os.name == "nt" else "which", "yt-dlp"],
 FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 if not os.path.exists(FFMPEG_PATH):
     FFMPEG_PATH = "ffmpeg"
+
+FFPROBE_PATH = os.path.join(BASE_DIR, "ffprobe.exe" if os.name == "nt" else "ffprobe")
+if not os.path.exists(FFPROBE_PATH):
+    FFPROBE_PATH = "ffprobe"
+
+def search_tubi(query):
+    url = f"https://api.tubitv.com/v3/search?q={query}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data and data.get("contents"):
+                return data
+            print("Tubi api.tubitv.com returned no contents, trying website fallback")
+    except Exception as e:
+        print(f"Tubi search error (api.tubitv.com): {e}")
+
+    # Fallback: some networks block/can't resolve api.tubitv.com specifically
+    # (DNS filtering, firewall rules on that subdomain, etc.) even though the
+    # main tubitv.com domain is reachable fine - get_tubi_stream() proves that
+    # by successfully hitting tubitv.com/movies/<id> via yt-dlp. So instead of
+    # the JSON API, scrape tubitv.com's own search results page and pull the
+    # results out of the page's embedded state JSON.
+    try:
+        return _search_tubi_via_website(query, headers)
+    except Exception as e:
+        print(f"Tubi search error (tubitv.com fallback): {e}")
+        return None
+
+
+def _search_tubi_via_website(query, headers):
+    """
+    Fallback search that hits tubitv.com's own search page directly instead
+    of api.tubitv.com. Tubi's site is a Next.js app, so the page ships its
+    data as JSON inside a <script id="__NEXT_DATA__"> tag rather than us
+    having to parse rendered HTML. Returns data shaped like the api.tubitv.com
+    response ({"contents": [...]}) so callers don't need to care which path
+    was used.
+
+    NOTE: this depends on the internal shape of Tubi's page-state JSON, which
+    isn't a documented contract and can shift if Tubi changes their site. If
+    this stops finding results, check the console output below - it prints
+    the top-level keys it found so you can see what moved.
+    """
+    url = f"https://tubitv.com/search/{urllib.parse.quote(query)}"
+    resp = requests.get(url, headers=headers, timeout=8)
+    if resp.status_code != 200:
+        print(f"Tubi website fallback: search page returned {resp.status_code}")
+        return None
+
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        resp.text,
+        re.DOTALL
+    )
+    if not match:
+        print("Tubi website fallback: couldn't find __NEXT_DATA__ block in page")
+
+        # Diagnostics: dump the raw page and list every script tag's id/type
+        # so we can see what Tubi's site is actually shipping instead of
+        # guessing blind. Check hub_tubi_debug.html and the console output.
+        try:
+            debug_path = os.path.join(BASE_DIR, "hub_tubi_debug.html")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(resp.text)
+            print(f"Tubi website fallback: saved raw page to {debug_path}")
+        except Exception as write_err:
+            print(f"Tubi website fallback: couldn't save debug HTML: {write_err}")
+
+        script_tags = re.findall(r'<script([^>]*)>', resp.text)
+        interesting = [s for s in script_tags if 'id=' in s or 'type="application/json"' in s]
+        print(f"Tubi website fallback: found {len(script_tags)} <script> tags, "
+              f"{len(interesting)} with an id or json type attribute:")
+        for s in interesting[:20]:
+            print(f"    <script{s}>")
+
+        return None
+
+    try:
+        next_data = json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        print(f"Tubi website fallback: __NEXT_DATA__ wasn't valid JSON: {e}")
+        return None
+
+    page_props = next_data.get("props", {}).get("pageProps", {})
+
+    # Tubi's site has moved this around before, so try a few known shapes
+    # instead of assuming just one.
+    candidates = (
+        page_props.get("results")
+        or page_props.get("searchResults")
+        or page_props.get("contents")
+        or page_props.get("initialState", {}).get("search", {}).get("results")
+        or []
+    )
+
+    contents = [item for item in candidates if isinstance(item, dict) and item.get("id")]
+
+    if not contents:
+        print(f"Tubi website fallback: no results found under pageProps keys {list(page_props.keys())}")
+        return None
+
+    return {"contents": contents}
+
+def get_tubi_stream(video_id):
+    # Constructing the standard web URL using the ID to feed into yt-dlp
+    tubi_url = f"https://tubitv.com/movies/{video_id}"
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best',
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(tubi_url, download=False)
+            return info.get('url')
+        except Exception as e:
+            print(f"Error extracting Tubi stream: {e}")
+            return None
+
+
+def search_tubi_videos(query):
+    """
+    Runs a Tubi search and normalizes the results into the same
+    dict shape that search_youtube() returns, so both sources can be
+    merged into a single results list and rendered by the same
+    video card / watch page. Tubi ids are stored with a 'tubi_'
+    prefix so downstream code (get_video, watch, like/dislike, etc.)
+    can tell them apart from YouTube ids.
+    """
+    if not query:
+        return []
+
+    tubi_results = search_tubi(query)
+    if not tubi_results or "contents" not in tubi_results:
+        return []
+
+    results = []
+    for item in tubi_results["contents"]:
+        raw_id = item.get("id")
+        if not raw_id:
+            continue
+
+        prefixed_id = f"tubi_{raw_id}"
+        title = item.get("title", "Unknown Tubi Title")
+        thumb_list = item.get("images", {}).get("thumbnail", [])
+        thumbnail_url = thumb_list[0] if thumb_list else ""
+        description = item.get("description", "No description available.")
+
+        upsert_video(prefixed_id, title, "Tubi TV", thumbnail_url, description)
+        results.append({
+            "id": prefixed_id,
+            "title": title,
+            "channel": "Tubi TV",
+            "thumbnail": thumbnail_url,
+            "description": description,
+            "likes_count": 0,
+            "dislikes_count": 0
+        })
+
+    return results
+
+
+# ====== TUBI CATALOG (DIRECT ID ENTRY) ======
+# Instead of scraping/searching Tubi's catalog, this now just takes a Tubi
+# video ID (or a full URL copied from Tubi's own address bar) and sends the
+# user straight to /watch/tubi_<id>, which already knows how to resolve and
+# stream that ID via get_tubi_stream(). No search, no scraping - just the
+# same thing that would happen if you typed the URL in yourself.
+def extract_tubi_id(raw_input):
+    """
+    Accepts either:
+      - a bare numeric Tubi ID, e.g. "100059630"
+      - a full Tubi URL copied from the address bar, e.g.
+        "https://tubitv.com/movies/100059630/some-title" or
+        "https://tubitv.com/tv-shows/100059630/some-show"
+    Returns the numeric ID string, or None if nothing usable was found.
+    """
+    if not raw_input:
+        return None
+
+    raw_input = raw_input.strip()
+
+    # Bare ID already
+    if raw_input.isdigit():
+        return raw_input
+
+    # Pull the ID out of a tubitv.com URL path (movies/<id>, tv-shows/<id>, series/<id>, etc.)
+    match = re.search(r'tubitv\.com/(?:movies|tv-shows|series|videos)/(\d+)', raw_input)
+    if match:
+        return match.group(1)
+
+    # Last resort: grab the first run of digits long enough to plausibly be a Tubi ID
+    match = re.search(r'(\d{5,})', raw_input)
+    if match:
+        return match.group(1)
+
+    return None
 
 
 # ====== DATABASE SETUP ======
@@ -138,7 +341,7 @@ def init_db():
     cur.execute("SELECT COUNT(*) FROM subscriptions")
     if cur.fetchone()[0] == 0:
         channels_list = [
-            "BADINFLUNCEYT","Selena Gomez","BADINFLUNCEYT", "SomeOrdinaryGamers", "Sam and Colby", "Clownfish TV", "JRE Clips", "Polecat324",
+            "BADINFLUNCEYT","Selena Gomez","King of the Hill", "SomeOrdinaryGamers", "Sam and Colby", "Clownfish TV", "JRE Clips", "Polecat324",
             "Lon.TV", "The Stevie Richards Show", "The Mirandalorian", "TechLinked", "Kid Rock",
             "Disney Kids", "Bay Area Buggs", "Evanescence", "Theo Von Clips", "Chibi Reviews",
             "CrapgamerReviews", "MAWK3", "Sinnon Nightcore", "Fox News", "ReviewTechUSA2",
@@ -163,6 +366,7 @@ def init_db():
     
     con.commit()
     con.close()
+
 
 
 def upsert_video(video_id, title, channel, thumbnail, description):
@@ -270,14 +474,14 @@ def scan_local_media_library():
     
     meta_map = {
         "movies": {"label": "Local Movies", "thumb": "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=500"},
-        "tv_shows": {"label": "Local TV Shows", "thumb": "https://images.unsplash.com/photo-1593789198777-f29bc259780e?w=500"}
+        "tv_shows": {"label": "Local TV Shows", "thumb": "https://images.unsplash.com/photo-1593789198777-f29bc259780e?w=500"},
+        "porn": {"label": "Local Porn", "thumb": "https://images.unsplash.com/photo-1593789198777-f29bc259780e?w=500"}
     }
     
     for category_key, target_directory in MEDIA_FOLDERS.items():
         if not os.path.exists(target_directory):
             continue
 
-        # First: scan video files directly in the base folder
         for file_name in os.listdir(target_directory):
             full_path = os.path.join(target_directory, file_name)
             if os.path.isfile(full_path) and file_name.lower().endswith(VIDEO_EXTENSIONS):
@@ -297,7 +501,6 @@ def scan_local_media_library():
                     "dislikes_count": 0
                 })
 
-        # Second: scan one level of subfolders for video files
         for entry in os.listdir(target_directory):
             subfolder_path = os.path.join(target_directory, entry)
             if os.path.isdir(subfolder_path):
@@ -437,6 +640,7 @@ def search_youtube(query):
     return raw_results
 
 
+
 def get_home_recommendations(user_id=None):
     fallback_queries = ["fivem server gameplay", "gta 5 rp", "lofi hip hop radio", "gaming highlights", "tech trends"]
     chosen_queries = []
@@ -471,34 +675,60 @@ def get_home_recommendations(user_id=None):
     chosen_queries.append(random.choice(fallback_queries))
     final_query_string = random.choice(chosen_queries)
     
-    # Returns purely online recommendation sets for the dashboard to keep the feed scrolling infinitely
     return search_youtube(final_query_string)[:100]
 
 
+
 # ====== YT-DLP CORE STREAM HELPERS ======
-def _base_ytdlp_cmd():
-    return [
+PLAYER_CLIENT_FALLBACKS = ["android", "ios", "web", "roku"]
+
+
+def _node_available():
+    try:
+        subprocess.run(["node", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+
+def _build_ytdlp_cmd(player_client, target_url):
+    cookie_file_path = os.path.join(BASE_DIR, "cookies.txt")
+    cmd = [
         YTDLP_PATH,
         "--ffmpeg-location", FFMPEG_PATH,
-        "--extractor-args", "youtube:player_client=android,web,ios",
+        "--extractor-args", f"youtube:player_client={player_client}",
         "--sponsorblock-remove", "sponsor,selfpromo,interaction",
-        "-f", "bestvideo[ext=mp4][height<=7680]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+        "--no-check-certificates",
+        # Single muxed (video+audio) format - this app proxies one raw URL
+        # straight into <video>; it does not merge separate streams with ffmpeg.
+        "-f", "best[ext=mp4]/best",
+        "--get-url",
+        target_url,
     ]
+    if os.path.exists(cookie_file_path):
+        cmd.extend(["--cookies", cookie_file_path])
+    return cmd
 
 
 def resolve_stream_urls(video_id):
     target = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = _base_ytdlp_cmd() + ["--get-url", target]
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
-    if result.returncode != 0 or not result.stdout.strip():
-        raise RuntimeError(result.stderr or "yt-dlp returned no output")
-    lines = [l for l in result.stdout.strip().split("\n") if l.startswith("http")]
-    if not lines:
-        raise RuntimeError("No HTTP URLs returned by yt-dlp")
-    video_url = lines[0]
-    audio_url = lines[1] if len(lines) > 1 else None
-    return {"video_url": video_url, "audio_url": audio_url}
+
+    last_error = "Unknown extraction failure"
+    for client in PLAYER_CLIENT_FALLBACKS:
+        cmd = _build_ytdlp_cmd(client, target)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
+        lines = [l for l in result.stdout.strip().split("\n") if l.startswith("http")] if result.stdout else []
+
+        if result.returncode == 0 and lines:
+            return {"video_url": lines[0], "audio_url": lines[1] if len(lines) > 1 else None}
+
+        last_error = (result.stderr or "").strip() or f"yt-dlp ({client} client) returned no usable output"
+
+    raise RuntimeError(last_error)
+
+
 
 
 # ====== STYLING LAYER ======
@@ -680,6 +910,7 @@ NAVBAR_HTML = """
         <span class="beta-badge">BETA DEVELOPMENT PORTAL</span>
         <a href="/media-library" class="nav-link" style="border-color:#e11d48; color:#e11d48;">LOCAL MEDIA</a>
         <a href="/subscriptions" class="nav-link" style="border-color:#4caf50; color:#4caf50;">MY SUBSCRIPTIONS</a>
+        <a href="/tubi-catalog" class="nav-link" style="border-color:#8e44ad; color:#8e44ad;">TUBI CATALOG</a>
         <a href="/feedback" class="nav-link" style="border-color:#ffb300; color:#ffb300;">COMMUNITY FEEDBACK</a>
         <a href="/about" class="nav-link">ABOUT PROJECT</a>
         <a href="/logout" class="nav-link" style="border-color:#ff4e4e; color:#ff4e4e;">SIGN OUT</a>
@@ -867,17 +1098,77 @@ WATCH_HTML = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ video.title }} - The Hub</title>
     """ + SHARED_CSS + """
-    <style>
-        video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 6px; border: 1px solid #2d2d2d; }
-        .action-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .voting-container { display: flex; gap: 8px; align-items: center; }
-        .like-btn { background: #2e7d32; color: white; font-weight: bold; border-radius: 20px; padding: 10px 22px; border: none; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }
-        .dislike-btn { background: #c62828; color: white; font-weight: bold; border-radius: 20px; padding: 10px 22px; border: none; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }
-        .comment-section { margin-top: 40px; border-top: 1px solid #333; padding-top: 20px; }
-        .comment-form input, .comment-form textarea { width: 100%; padding: 12px; background: #121212; border: 1px solid #444; color: white; border-radius: 4px; margin-bottom: 10px; box-sizing: border-box; font-family: Arial, sans-serif; }
-        .submit-btn { background: #1e88e5; }
-        .drm-notice { padding: 50px; text-align: center; background: #1e1e1e; border-radius: 6px; color: #aaa; }
-    </style>
+<style>
+    video {
+        width: 100%;
+        aspect-ratio: 16/9;
+        background: #000;
+        border-radius: 6px;
+        border: 1px solid #2d2d2d;
+    }
+    .action-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+    .voting-container {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    }
+    .like-btn {
+        background: #2e7d32;
+        color: white;
+        font-weight: bold;
+        border-radius: 20px;
+        padding: 10px 22px;
+        border: none;
+        cursor: pointer;
+        font-size: 14px;
+        text-decoration: none;
+        display: inline-block;
+    }
+    .dislike-btn {
+        background: #c62828;
+        color: white;
+        font-weight: bold;
+        border-radius: 20px;
+        padding: 10px 22px;
+        border: none;
+        cursor: pointer;
+        font-size: 14px;
+        text-decoration: none;
+        display: inline-block;
+    }
+    .comment-section {
+        margin-top: 40px;
+        border-top: 1px solid #333;
+        padding-top: 20px;
+    }
+    .comment-form input, .comment-form textarea {
+        width: 100%;
+        padding: 12px;
+        background: #121212;
+        border: 1px solid #444;
+        color: white;
+        border-radius: 4px;
+        margin-bottom: 10px;
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+    }
+    .submit-btn {
+        background: #1e88e5;
+    }
+    .drm-notice {
+        padding: 50px;
+        text-align: center;
+        background: #1e1e1e;
+        border-radius: 6px;
+        color: #aaa;
+    }
+</style>
 </head>
 <body>
 """ + NAVBAR_HTML + """
@@ -885,21 +1176,32 @@ WATCH_HTML = """<!DOCTYPE html>
     <a href="javascript:history.back()" class="back-btn">&#10229; Return to Previous Screen</a>
 
     {% if stream_link %}
-        <video id="hub-player" controls autoplay>
-            <source src="{{ stream_link }}" type="video/mp4">
-        </video>
+    <video id="hub-player" controls autoplay></video>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script>
+        (function() {
+            const video = document.getElementById('hub-player');
+            const streamSource = {{ stream_link | tojson }};
+            const isHls = streamSource.indexOf('.m3u8') !== -1;
+
+            if (isHls && window.Hls && Hls.isSupported()) {
+                const hls = new Hls();
+                hls.loadSource(streamSource);
+                hls.attachMedia(video);
+            } else {
+                // Direct-playable (mp4, or Safari's native HLS support)
+                video.src = streamSource;
+            }
+        })();
+    </script>
     {% else %}
-        <div class="drm-notice">
-            Video is protected by DRM. That is the only reason why the video cannot be streamed.
-            We are working on a fix. Please be patient.
-        </div>
+    <div class="drm-notice">
+        Video stream could not be loaded directly by the browser proxy player context.
+    </div>
     {% endif %}
 
     <div class="warning-banner">
-        <strong>NATIVE SYSTEM NOTICE:</strong> If you plan to submit a comment below, please ensure
-        you finish watching your media first. Because this platform is hard-sandboxed without
-        tracking scripts, submitting a comment will reload the page and reset the player
-        back to the beginning.
+        <strong>NATIVE SYSTEM NOTICE:</strong> Comments, Upfolks, and Downfolks are transmitted in the background - the player keeps running and the page will not reload.
     </div>
 
     <div class="meta-panel">
@@ -909,14 +1211,14 @@ WATCH_HTML = """<!DOCTYPE html>
                 <span style="color: #aaa;">Source Node: {{ video.channel }}</span>
             </div>
             <div class="voting-container">
-                <form action="/like/{{ video_id }}" method="POST" style="margin: 0;">
+                <form action="/like/{{ video_id }}" method="POST" style="margin: 0;" class="vote-form" data-endpoint="/like/{{ video_id }}">
                     <button type="submit" class="like-btn">
-                        Upfolk ({{ video.likes_count }})
+                        Upfolk (<span id="likes-count">{{ video.likes_count }}</span>)
                     </button>
                 </form>
-                <form action="/dislike/{{ video_id }}" method="POST" style="margin: 0;">
+                <form action="/dislike/{{ video_id }}" method="POST" style="margin: 0;" class="vote-form" data-endpoint="/dislike/{{ video_id }}">
                     <button type="submit" class="dislike-btn">
-                        Downfolk ({{ video.dislikes_count if video.dislikes_count else 0 }})
+                        Downfolk (<span id="dislikes-count">{{ video.dislikes_count if video.dislikes_count else 0 }}</span>)
                     </button>
                 </form>
             </div>
@@ -926,13 +1228,12 @@ WATCH_HTML = """<!DOCTYPE html>
 
     <div class="comment-section">
         <h3 id="comments-focus">Local Portal Comments (Bypasses YouTube Infrastructure)</h3>
-
-        <form action="/comment/{{ video_id }}" method="POST" class="comment-form">
-            <textarea name="comment_text" rows="3" placeholder="Leave localized feedback as {{ current_username }}..." required></textarea>
+        <form id="comment-form" action="/comment/{{ video_id }}" method="POST" class="comment-form">
+            <textarea id="comment-text-input" name="comment_text" rows="3" placeholder="Leave localized feedback as {{ current_username }}..." required></textarea>
             <button type="submit" class="btn submit-btn">Transmit Local Message</button>
         </form>
 
-        <div style="margin-top: 25px;">
+        <div id="comments-list" style="margin-top: 25px;">
             {% for comment in comments %}
             <div class="comment-card">
                 <strong style="color: #1e88e5;">{{ comment.username }}</strong>
@@ -940,11 +1241,76 @@ WATCH_HTML = """<!DOCTYPE html>
                 <p style="margin: 8px 0 0 0; color: #ccc;">{{ comment.comment_text }}</p>
             </div>
             {% else %}
-            <p style="color: #666; font-style: italic;">No comments saved to this channel yet.</p>
+            <p id="no-comments-msg" style="color: #666; font-style: italic;">No comments saved to this channel yet.</p>
             {% endfor %}
         </div>
     </div>
 </div>
+<script>
+(function() {
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // Comment form - submit via fetch, prepend the new comment, no reload.
+    const commentForm = document.getElementById('comment-form');
+    if (commentForm) {
+        commentForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            const textarea = document.getElementById('comment-text-input');
+            const text = textarea.value.trim();
+            if (!text) return;
+
+            fetch(commentForm.action, {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                body: new URLSearchParams({ comment_text: text })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.error) { alert(data.error); return; }
+
+                const noCommentsMsg = document.getElementById('no-comments-msg');
+                if (noCommentsMsg) noCommentsMsg.remove();
+
+                const list = document.getElementById('comments-list');
+                const card = document.createElement('div');
+                card.className = 'comment-card';
+                card.innerHTML =
+                    '<strong style="color: #1e88e5;">' + escapeHtml(data.username) + '</strong>' +
+                    '<span style="font-size: 11px; color: #666; margin-left: 10px;">' + escapeHtml(data.timestamp) + '</span>' +
+                    '<p style="margin: 8px 0 0 0; color: #ccc;">' + escapeHtml(data.comment_text) + '</p>';
+                list.insertBefore(card, list.firstChild);
+
+                textarea.value = '';
+            })
+            .catch(err => console.error('Comment submit failed:', err));
+        });
+    }
+
+    // Upfolk / Downfolk - submit via fetch, update the count in place, no reload.
+    document.querySelectorAll('.vote-form').forEach(function(form) {
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            fetch(form.dataset.endpoint, {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.error) return;
+                const likesEl = document.getElementById('likes-count');
+                const dislikesEl = document.getElementById('dislikes-count');
+                if (likesEl) likesEl.textContent = data.likes_count;
+                if (dislikesEl) dislikesEl.textContent = data.dislikes_count;
+            })
+            .catch(err => console.error('Vote submit failed:', err));
+        });
+    });
+})();
+</script>
 </body>
 </html>
 """
@@ -961,41 +1327,26 @@ ABOUT_HTML = """<!DOCTYPE html>
 """ + NAVBAR_HTML + """
 <div class="container" style="max-width: 800px;">
     <a href="/" class="back-btn">&#10229; Return to Dashboard</a>
-
     <div class="manifesto-box">
         <h2>The Hub Platform Blueprint (Alpha/Beta Stage)</h2>
         <p>
-            Welcome to <strong>The Hub</strong>. This application is an active architectural concept
-            built to demonstrate that a high-speed video environment can run completely decoupled
-            from corporate tracking dependencies and broken web layers.
+            Welcome to <strong>The Hub</strong>. This application is an active architectural concept built to demonstrate that a high-speed video environment can run completely decoupled from corporate tracking dependencies and broken web layers.
         </p>
         <p>
-            Currently, the script acts as an isolated privacy proxy layer, scraping standard public
-            video endpoints and serving raw video packages directly to your terminal without tracking
-            scripts, tracking cookies, or intrusive mid-roll ads.
+            Currently, the script acts as an isolated privacy proxy layer, scraping standard public video endpoints and serving raw video packages directly to your terminal without tracking scripts, tracking cookies, or intrusive mid-roll ads.
         </p>
-
         <h3>Strategic Development Phases:</h3>
         <ul>
             <li>
-                <strong>Phase 1 (Current):</strong> Bootstrapping off public catalogs. Video index
-                frames are stored dynamically in a localized SQLite archive database to build
-                independent local structures.
+                <strong>Phase 1 (Current):</strong> Bootstrapping off public catalogs. Video index frames are stored dynamically in a localized SQLite archive database to build independent local structures.
             </li>
             <li>
-                <strong>Phase 2 (Independent Social Systems):</strong> Restoring historical
-                infrastructure options removed by corporate tech, such as localized discussion chains,
-                direct text channels, and independent upvotes completely separated from YouTube
-                tracking clusters.
+                <strong>Phase 2 (Independent Social Systems):</strong> Restoring historical infrastructure options removed by corporate tech, such as localized discussion chains, direct text channels, and independent upvotes completely separated from YouTube tracking clusters.
             </li>
             <li>
-                <strong>Phase 3 (Decentralized Server Migration):</strong> Relocating to dedicated
-                cloud hardware. To support direct standalone user uploads, the system will feature
-                micro-funding loops with low-cost monthly premium tiers (around $10 to $15) solely
-                to cover raw network hosting fees without selling user telemetry.
+                <strong>Phase 3 (Decentralized Server Migration):</strong> Relocating to dedicated cloud hardware. To support direct standalone user uploads, the system will feature micro-funding loops with low-cost monthly premium tiers (around $10 to $15) solely to cover raw network hosting fees without selling user telemetry.
             </li>
         </ul>
-
         <p style="background: #1565c0; padding: 12px; border-radius: 4px; color: white; font-weight: bold; text-align: center; margin-top: 30px;">
             Reclaiming utility. Zero Client Scripts. Built for performance.
         </p>
@@ -1043,32 +1394,104 @@ COMMUNITY_FEEDBACK_HTML = """<!DOCTYPE html>
         <p style="color: #ddd; line-height: 1.5; font-size: 15px; white-space: pre-wrap;">{{ post.suggestion }}</p>
 
         <div class="nested-box">
-            <h4 style="margin: 0 0 10px 0; font-size: 13px; color: #1e88e5;">Chime in / Refine this Suggestion:</h4>
-            
-            {% for f_comment in post.comments %}
-            <div style="background: #151515; padding: 10px; border-radius: 4px; margin-bottom: 8px; border-left: 3px solid #ffb300;">
-                <span style="font-size: 12px; color: #1e88e5; font-weight: bold;">{{ f_comment.username }}</span>
-                <span style="font-size: 10px; color: #555; margin-left: 8px;">{{ f_comment.timestamp }}</span>
-                <p style="margin: 4px 0 0 0; color: #bbb; font-size: 13px;">{{ f_comment.comment_text }}</p>
+            <h4 style="margin: 0 0 10px 0; color: #ffb300; font-size: 13px;">Developer Notes & Responses</h4>
+            {% for c in post.comments %}
+            <div style="background: #252525; padding: 10px; border-radius: 4px; margin-bottom: 8px; border-left: 2px solid #ffb300;">
+                <span style="font-size: 12px; color: #aaa;"><strong>{{ c.username }}</strong>:</span>
+                <span style="font-size: 12px; color: #eee; margin-left: 5px;">{{ c.comment_text }}</span>
             </div>
             {% endfor %}
 
-            <form action="/feedback/comment/{{ post.id }}" method="POST" style="display: flex; gap: 8px; margin-top: 12px;">
-                <input type="text" name="f_comment_text" placeholder="Add your ideas or refinements to this concept..." style="padding: 8px;" required>
-                <button type="submit" style="padding: 8px 16px; font-size: 12px; background: #2a2a2a; border: 1px solid #444;">Add Input</button>
+            <form action="/feedback/comment/{{ post.id }}" method="POST" style="display: flex; gap: 8px; margin-top: 10px;">
+                <input type="text" name="comment_text" placeholder="Add down-stream analysis or update notes..." style="padding: 8px; font-size: 13px;" required>
+                <button type="submit" style="padding: 8px 16px; font-size: 13px; background: #333; color: #fff; border: 1px solid #444;">Reply</button>
             </form>
         </div>
     </div>
     {% else %}
-    <p style="color: #666; font-style: italic; text-align: center; padding: 40px;">The development roadmap pipeline is empty. Submit the first community asset concept above!</p>
+    <p style="color: #666; font-style: italic;">No community suggestions have been submitted yet.</p>
     {% endfor %}
 </div>
 </body>
 </html>
 """
 
+SUBSCRIPTIONS_ROOM_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Subscriptions - The Hub</title>
+    """ + SHARED_CSS + """
+</head>
+<body>
+""" + NAVBAR_HTML + """
+<div class="container" style="max-width: 900px;">
+    <h2>Channel Subscriptions Management (Bypasses Main Feed)</h2>
+    <p style="color: #aaa;">Manage the channels indexed directly in your isolated pipeline database. Click any channel block below to instantly generate a custom filtered recommendation stream.</p>
+    
+    <div class="meta-panel" style="margin-bottom: 30px; border-color: #4caf50;">
+        <h3 style="color: #4caf50; margin-top: 0;">Add New Channel Track Node</h3>
+        <form action="/subscriptions/add" method="POST" style="display: flex; gap: 10px;">
+            <input type="text" name="channel_name" placeholder="Exact Channel Name (e.g., 'Linus Tech Tips')" required>
+            <button type="submit" style="background: #4caf50;">Bind to Hub Matrix</button>
+        </form>
+    </div>
 
-# ====== PLATFORM AUTH ENDPOINTS ======
+    <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+        {% for ch in channels %}
+        <div style="background: #1e1e1e; padding: 10px 18px; border-radius: 20px; border: 1px solid #333; display: flex; align-items: center; gap: 12px;">
+            <a href="/search?q={{ ch.channel_name | urlencode }}&mode=subs" style="color: #fff; text-decoration: none; font-weight: bold; font-size: 14px;">{{ ch.channel_name }}</a>
+            <form action="/subscriptions/delete/{{ ch.id }}" method="POST" style="margin: 0; display: inline;">
+                <button type="submit" style="background: none; border: none; color: #ff4e4e; cursor: pointer; padding: 0; font-size: 14px; font-weight: bold;">&times;</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+TUBI_CATALOG_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tubi Catalog - The Hub</title>
+    """ + SHARED_CSS + """
+</head>
+<body>
+""" + NAVBAR_HTML + """
+<div class="container">
+    <h2>Tubi Direct Player</h2>
+    <p style="color: #aaa; margin-top: -10px;">
+        Grab the ID (or the whole URL) from Tubi's address bar - e.g. tubitv.com/movies/<b>100059630</b>/some-title -
+        paste it below and click Load Video to jump straight to the player.
+    </p>
+
+    {% if error %}
+    <p style="color: #ff6b6b; font-weight: bold;">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST" action="/tubi-catalog" style="display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0 30px 0;">
+        <input type="text" name="tubi_id" placeholder="Tubi ID or tubitv.com URL"
+               value="{{ last_input or '' }}"
+               style="flex: 1; min-width: 260px; padding: 12px 16px; font-size: 14px; border-radius: 8px;
+                      border: 1px solid #333; background: #1e1e1e; color: #fff;">
+        <button type="submit" class="btn"
+                style="background: #8e44ad; border: 1px solid #a55cd1; color: #fff; padding: 12px 28px;
+                       font-size: 14px; border-radius: 8px; cursor: pointer;">
+            Load Video
+        </button>
+    </form>
+</div>
+</body>
+</html>
+"""
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.form if request.form else (request.get_json() or {})
@@ -1145,11 +1568,13 @@ def media_library_view():
     
     movies_list = [item for item in all_local_assets if item["category"] == "movies"]
     tv_shows_list = [item for item in all_local_assets if item["category"] == "tv_shows"]
+    porn_list = [item for item in all_local_assets if item["category"] == "porn"]
     
     return render_template_string(
         MEDIA_LIBRARY_HTML,
         movies=movies_list,
-        tv_shows=tv_shows_list
+        tv_shows=tv_shows_list,
+        porn=porn_list
     )
 
 
@@ -1194,6 +1619,28 @@ def subscriptions_feed():
     )
 
 
+@app.route("/tubi-catalog", methods=["GET", "POST"])
+def tubi_catalog():
+    user = get_current_user()
+    if not user:
+        return render_template_string(GATEKEEPER_LOGIN_HTML)
+
+    if request.method == "POST":
+        raw_input = request.form.get("tubi_id", "").strip()
+        parsed_id = extract_tubi_id(raw_input)
+
+        if parsed_id:
+            return redirect(url_for("watch", video_id=f"tubi_{parsed_id}"))
+
+        return render_template_string(
+            TUBI_CATALOG_HTML,
+            error="Couldn't find a valid Tubi ID in that - paste the ID itself or the full tubitv.com URL.",
+            last_input=raw_input
+        )
+
+    return render_template_string(TUBI_CATALOG_HTML, error=None, last_input="")
+
+
 @app.route("/search")
 def search():
     user = get_current_user()
@@ -1211,8 +1658,8 @@ def search():
             
     local_items = scan_local_media_library()
     filtered_local = [v for v in local_items if raw_prompt.lower() in v["title"].lower()]
-    
-    videos = filtered_local + search_youtube(raw_prompt)
+
+    videos = filtered_local + search_youtube(raw_prompt) + search_tubi_videos(raw_prompt)
     for v in videos:
         if v["id"].startswith("local_"):
             continue
@@ -1228,6 +1675,7 @@ def search():
         append_mode=False,
         subscription_view=False
     )
+
 
 
 @app.route("/api/roku/search")
@@ -1253,6 +1701,7 @@ def api_roku_search():
     local_assets = scan_local_media_library()
     local_movies_row = []
     local_tv_row = []
+    local_porn_row = []
 
     if query:
         for item in local_assets:
@@ -1442,23 +1891,90 @@ def _set_cached_stream_url(video_id: str, url: str):
 @app.route("/api/roku/stream/<video_id>", methods=["GET"])
 def api_roku_stream(video_id):
     print(f"[ROKU] Stream resolve request for video_id={video_id}")
-    
+
     if video_id.startswith("local_"):
         local_assets = scan_local_media_library()
-        match = next((v for v in local_assets if v["video_id"] == video_id), None)
-        if not match or not os.path.exists(match["file_path"]):
+        local_match = next((v for v in local_assets if v["video_id"] == video_id), None)
+        if not local_match or not os.path.exists(local_match["file_path"]):
             return "Local file missing or offline", 404
-            
-        file_path = match["file_path"]
+
+        file_path = local_match["file_path"]
+
+        # ── MKV: transcode on-the-fly to a fragmented MP4 stream ──────────────
+        if file_path.lower().endswith('.mkv'):
+            print(f"[ROKU] MKV container detected for {video_id}. Analysing codec.")
+
+            # Detect the video codec inside the MKV with ffprobe
+            ffprobe_path = FFPROBE_PATH
+            probe_cmd = [
+                ffprobe_path, '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'csv=p=0',
+                file_path
+            ]
+            try:
+                video_codec = subprocess.check_output(probe_cmd, stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                print(f"[ROKU] Detected video codec: {video_codec}")
+            except Exception as probe_err:
+                video_codec = "hevc"  # safe default: force transcode when probe fails
+                print(f"[ROKU] ffprobe failed, forcing h264 transcode to be safe: {probe_err}")
+
+            # x265/HEVC must be transcoded; x264 can be stream-copied directly
+            if "265" in video_codec or "hevc" in video_codec.lower():
+                print(f"[ROKU] x265/HEVC detected — live CPU transcode to h264.")
+                video_flag = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
+            else:
+                print(f"[ROKU] x264 detected — using zero-CPU stream copy.")
+                video_flag = ['-c:v', 'copy']
+
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                '-i', file_path,
+            ] + video_flag + [
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-ac', '2',
+                '-f', 'mp4',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                'pipe:1'
+            ]
+
+            def generate_ffmpeg_stream():
+                process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=1024 * 64
+                )
+                try:
+                    while True:
+                        data = process.stdout.read(1024 * 64)
+                        if not data:
+                            break
+                        yield data
+                except Exception as stream_err:
+                    print(f"[ROKU] Stream interrupted: {stream_err}")
+                finally:
+                    process.kill()
+                    process.wait()
+                    print(f"[ROKU] FFmpeg pipeline closed for {video_id}")
+
+            resp = Response(generate_ffmpeg_stream(), status=200, mimetype='video/mp4')
+            resp.headers['Accept-Ranges'] = 'none'
+            return resp
+        # ── END MKV block ──────────────────────────────────────────────────────
+
+        # Original MP4 byte-range logic (unchanged)
         file_size = os.path.getsize(file_path)
         byte_range = request.headers.get('Range', None)
-        
+
         if byte_range:
             match_range = re.search(r'bytes=(\d+)-(\d*)', byte_range)
             start_byte = int(match_range.group(1))
             end_byte = int(match_range.group(2)) if match_range.group(2) else file_size - 1
             length = (end_byte - start_byte) + 1
-            
+
             def generate_chunks():
                 with open(file_path, 'rb') as f:
                     f.seek(start_byte)
@@ -1470,7 +1986,7 @@ def api_roku_stream(video_id):
                             break
                         yield data
                         remaining -= len(data)
-                        
+
             resp = Response(generate_chunks(), status=206, mimetype='video/mp4')
             resp.headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
             resp.headers['Accept-Ranges'] = 'bytes'
@@ -1537,6 +2053,13 @@ def watch(video_id):
 
     if video_id.startswith("local_"):
         stream_link = f"/api/roku/stream/{video_id}"
+    elif video_id.startswith("tubi_"):
+        stream_link = None
+        try:
+            raw_tubi_id = video_id[len("tubi_"):]
+            stream_link = get_tubi_stream(raw_tubi_id)
+        except Exception as e:
+            print(f"Tubi stream resolve error for {video_id}: {e}", file=sys.stderr)
     else:
         stream_link = None
         try:
@@ -1557,12 +2080,24 @@ def watch(video_id):
     )
 
 
+def _is_ajax():
+    return request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+
 @app.route("/like/<video_id>", methods=["POST"])
 def like(video_id):
     user = get_current_user()
     if not user:
+        if _is_ajax():
+            return jsonify({"error": "Not authenticated"}), 401
         return render_template_string(GATEKEEPER_LOGIN_HTML)
     increment_likes(video_id)
+    if _is_ajax():
+        row = get_video(video_id)
+        return jsonify({
+            "likes_count": row["likes_count"] if row else 0,
+            "dislikes_count": row["dislikes_count"] if row else 0
+        })
     return redirect(url_for("watch", video_id=video_id) + "#comments-focus")
 
 
@@ -1570,8 +2105,16 @@ def like(video_id):
 def dislike(video_id):
     user = get_current_user()
     if not user:
+        if _is_ajax():
+            return jsonify({"error": "Not authenticated"}), 401
         return render_template_string(GATEKEEPER_LOGIN_HTML)
     increment_dislikes(video_id)
+    if _is_ajax():
+        row = get_video(video_id)
+        return jsonify({
+            "likes_count": row["likes_count"] if row else 0,
+            "dislikes_count": row["dislikes_count"] if row else 0
+        })
     return redirect(url_for("watch", video_id=video_id) + "#comments-focus")
 
 
@@ -1579,12 +2122,23 @@ def dislike(video_id):
 def comment(video_id):
     user = get_current_user()
     if not user:
+        if _is_ajax():
+            return jsonify({"error": "Not authenticated"}), 401
         return render_template_string(GATEKEEPER_LOGIN_HTML)
-        
+
     username = user["username"]
     comment_text = request.form.get("comment_text", "").strip()
     if comment_text:
         add_comment(video_id, username, comment_text)
+
+    if _is_ajax():
+        if not comment_text:
+            return jsonify({"error": "Comment was empty"}), 400
+        return jsonify({
+            "username": username,
+            "comment_text": comment_text,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
     return redirect(url_for("watch", video_id=video_id) + "#comments-focus")
 
 
@@ -1729,6 +2283,65 @@ def proxy_stream():
             if chunk:
                 yield chunk
     return Response(stream_with_context(generate()), status=status, headers=resp_headers)
+
+@app.route("/live-stream")
+def live_stream_view():
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Live Web Stream</title>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <style>
+            body { background-color: #0c0c0c; color: #fff; text-align: center; font-family: Arial, sans-serif; padding-top: 50px; }
+            .video-wrap { width: 85%; max-width: 1024px; margin: 0 auto; box-shadow: 0 0 30px rgba(0,0,0,0.8); }
+            video { width: 100%; display: block; border: 1px solid #333; }
+        </style>
+    </head>
+    <body>
+        <h2>Live Platform Feed</h2>
+        <div class="video-wrap">
+            <video id="videoPlayer" controls autoplay muted></video>
+        </div>
+
+        <script>
+            const video = document.getElementById('videoPlayer');
+            // Points to the stream file managed by our Flask routing below
+            const streamSource = '/live-files/stream0.m3u8'; 
+
+            if (Hls.isSupported()) {
+                const hls = new Hls();
+                hls.loadSource(streamSource);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    video.play();
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = streamSource;
+            }
+        </script>
+    </body>
+    </html>
+    """)
+
+@app.route("/live-files/<path:filename>")
+def serve_live_hls_files(filename):
+    # This targets the 'hls_output' folder in the exact directory where app.py lives
+    hls_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hls_output")
+    file_path = os.path.join(hls_dir, filename)
+    
+    if not os.path.exists(file_path):
+        return "File not found", 404
+        
+    if filename.endswith(".m3u8"):
+        mimetype = "application/x-mpegURL"
+    elif filename.endswith(".ts"):
+        mimetype = "video/MP2T"
+    else:
+        mimetype = "application/octet-stream"
+        
+    return send_file(file_path, mimetype=mimetype)
 
 
 if __name__ == "__main__":
